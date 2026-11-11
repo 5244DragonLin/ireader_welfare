@@ -1,0 +1,37 @@
+# 字节码 / 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 打包 / 构建
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# 用户本地配置（含账号密码，禁止提交）
+config.yaml
+
+# 输出与凭证
+output/
+credentials.json
+
+# 日志
+*.log
+logs/
+
+# 本地工作记忆（AI 助手会话记录，不入库）
+.workbuddy/
+
+# 编辑器 / 工具
+.idea/
+.vscode/
+
+# 系统
+.DS_Store
+Thumbs.db
