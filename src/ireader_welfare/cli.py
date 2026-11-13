@@ -443,15 +443,23 @@ def do_report_read_time(c: WelfareClient, minutes: int = 180,
         print(f"\n阅读时长: 上报失败（{e}）—— 跳过，继续领奖")
         return False
     if not out:
-        # 已铺满或当前时刻距零点不足，属正常，不打扰
+        # 没有可铺的新时段：要么今天已铺满，要么当前时刻距零点不足。
+        # 后者是常见的「没铺满」原因（例如把任务排在每天 00:30，全天只过了 30 分钟），
+        # 静默会让人误以为上报出了问题，所以这里明确提示。
+        print(f"\n阅读时长: 本次无可铺时段（目标 {minutes} 分钟）"
+              f"—— 今天已铺满，或当前时刻距零点不足 {minutes} 分钟")
         return False
     ok = sum(1 for x in out if x["ok"])
     if verbose:
         print(f"阅读时长: 完成 {ok}/{len(out)} 段")
-    else:
-        mins = sum((x["to"] - x["from"]) // 60000 for x in out if x["ok"])
-        tail = "" if ok == len(out) else f"（{len(out) - ok} 段失败）"
-        print(f"\n阅读时长: 上报 {mins} 分钟，{ok}/{len(out)} 段成功{tail}")
+        return ok > 0
+    mins = sum((x["to"] - x["from"]) // 60000 for x in out if x["ok"])
+    tail = "" if ok == len(out) else f"（{len(out) - ok} 段失败）"
+    print(f"\n阅读时长: 上报 {mins} 分钟，{ok}/{len(out)} 段成功{tail}")
+    if mins < minutes:
+        # 窗口只能铺在「今天零点~此刻」之间，报不满时最可能的原因就是跑得太早。
+        print(f"  [!] 未达目标 {minutes} 分钟：窗口只铺到今天此刻，"
+              f"稍晚再跑一次可补齐剩余 {minutes - mins} 分钟（工具会自动跳过已报时段）")
     return ok > 0
 
 
@@ -593,7 +601,9 @@ def main(argv=None):
     if args.command in ("run", "tasks") and not args.no_tasks:
         do_tasks(c, vb)
     if args.command in ("run", "wheel") and not args.no_wheel:
-        do_wheel(c, vb)
+        # 必须用关键字传参：do_wheel 的第二个形参是 max_times 而不是 verbose，
+        # 按位置传 vb 会让精简模式（vb=False）变成 max_times=0，静默一次都不抽。
+        do_wheel(c, verbose=vb)
     if args.command in ("run", "lottery") and not args.no_lottery:
         do_read_lottery(c, vb)
     if args.command in ("run", "box") and not args.no_box:
