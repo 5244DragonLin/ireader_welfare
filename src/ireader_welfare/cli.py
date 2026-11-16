@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import time
 
 from . import auth, config, welfare
 from .welfare import (
@@ -142,6 +143,21 @@ def show_status(c: WelfareClient):
         )
         print(f"  本周进度 : {bar}   (■已签 □今天 ·未到)")
 
+    # 等级经验：成长任务每天给经验，攒够才升级（升级发代金券/VIP）。
+    # 这套数据和福利中心分开，接口偶发失败不影响主面板，静默跳过。
+    try:
+        lv = c.level_state()
+        info = lv.get("userInfo") or {}
+        if info:
+            cur, need = int(info.get("currentExp") or 0), int(info.get("exp") or 0)
+            gap = max(0, need - cur)
+            print(f"  等级经验 : {cur}/{need}  (Lv{info.get('level')}，还差 {gap} 升级)")
+            todo = [t for t in (lv.get("taskInfo") or []) if t.get("status") == 0]
+            if todo:
+                print(f"    经验任务 : {'、'.join(t.get('name') or '' for t in todo)}")
+    except Exception:
+        pass
+
     show_vouchers(c)
     box = c.box_state()
     print(f"  本周活跃值: {box['score']}")
@@ -170,14 +186,56 @@ def show_status(c: WelfareClient):
         cs = [x for x in c.coupons() if not x["expired"]]
     except Exception:
         cs = []
+    # 淘书市的券（名字带「淘书市」，如 180淘书市-24）单独一组，方便对账
+    tst = [x for x in cs if "淘书市" in x["name"]]
+    cs = [x for x in cs if "淘书市" not in x["name"]]
     if cs:
         print(f"  满减券   : {len(cs)} 张可用")
         for x in cs:
             print(f"    {x['name']}  {x['valid']}")
+    if tst:
+        print(f"  淘书市券 : {len(tst)} 张可用")
+        for x in tst:
+            print(f"    {x['name']}  {x['valid']}")
+
+
+def show_cross_app_tasks(c: WelfareClient):
+    """显示跨 App 换量任务（如「打开携程做任务领 +5 满减券」）。
+
+    这条任务纯 HTTP 做不完，原因不是参数没猜对，而是完成信号由**对方 App**
+    回跳时产生——服务端在那一刻往会话里写 `cooperation_source`，而没有任何
+    接口允许客户端自己设置它（实测见 docs 逆向笔记十八节）。
+
+    但它会**间歇性下发**，且默认渠道号看不到。不显式列出来，用户会以为
+    「任务不存在」，或者在 App 里手动做完却不知道为什么工具没报。
+
+    所以这里的职责只是：看见了就诚实说「看见了，但做不了」，并说清怎么手动做。
+    """
+    try:
+        items = c.cross_app_tasks()
+    except Exception:
+        return          # 换量任务查询失败不阻塞主面板
+    if not items:
+        return
+
+    for t in items:
+        status = t.get("status")
+        if status == 2:
+            print(f"\n  跨App任务: {t['name']} — 已领取")
+            continue
+        if status == 1:
+            print(f"\n  跨App任务: {t['name']} — 已完成，待领取（跑 tasks 领奖）")
+            continue
+        # 未完成：这条只能手动做
+        print(f"\n  跨App任务: {t['name']}  {t.get('award') or ''}")
+        print("    需在 App 里手动完成：点「去完成」→ 跳转到对方 App → 按对方要求操作")
+        print("    本工具不做这条（完成信号由对方 App 回跳产生，纯 HTTP 无法构造）")
 
 
 def show_tasks(c: WelfareClient):
     # 看视频
+    # 注意：/zycl/welfare/video/status 对本工具的会话可能恒返 53002（已用完），
+    # 与 H5 实际状态不一致，所以这里同时显示服务端下发的广告策略作为佐证。
     vs = c.video_status("VIDEO_PAYTASK")
     vb = vs.get("body") or {}
     if vs.get("code") == CODE_OK and vb.get("show"):
@@ -186,6 +244,20 @@ def show_tasks(c: WelfareClient):
         print(f"  看视频   : 未开放（{vs.get('msg')}）")
     else:
         print(f"  看视频   : {vs.get('msg')}")
+
+    # 广告策略（/ad/cfg）：能拿到说明服务端已识别本客户端，可看到真实投放源
+    try:
+        from .adcfg import fetch_rules, slot_strategies
+        rules = fetch_rules(c.cred)
+        if rules:
+            st = slot_strategies(rules, "VIDEO_PAYTASK")
+            srcs = [x.get("source") for x in st if x.get("source")]
+            print(f"  视频投放 : {len(st)} 个源  ({', '.join(srcs)})" if st
+                  else "  视频投放 : 策略里无视频位")
+        else:
+            print("  视频投放 : 策略未下发")
+    except Exception:
+        pass
 
     # 分享日签
     # 注意：/welfare/sign/today/share 的 status 是黄历「宜/忌」标记，
@@ -197,7 +269,7 @@ def show_tasks(c: WelfareClient):
         elif st_task.get("status") == 1:
             print("  分享日签 : 已完成，待领取（跑 tasks 领奖）")
         else:
-            print("  分享日签 : 未完成　→ 需在 App 内点一次真实分享")
+            print("  分享日签 : 未完成　→ 跑 tasks 自动补一次分享上报")
     else:
         print("  分享日签 : 服务端未下发该任务")
 
@@ -210,6 +282,8 @@ def show_tasks(c: WelfareClient):
     else:
         print("\n—— 日常任务 ——")
         print("  服务端未下发任务列表")
+
+    show_cross_app_tasks(c)
 
     # 阅读任务
     rl = (c.read_tasks().get("body") or {}).get("list") or []
@@ -400,6 +474,158 @@ def do_read(c: WelfareClient, verbose: bool = False) -> bool:
     return gained > 0
 
 
+def do_level_tasks(c: WelfareClient, verbose: bool = False) -> bool:
+    """等级成长任务：把「浏览书城超过20秒」这类回执型任务走完并领经验。
+
+    与福利中心的日常任务无关——这是「我的 → Lv 勋章 → 我的等级」那套，
+    奖励是经验值（升级才发代金券/VIP），接口在 /zyuc/api/user/ 下、
+    签名规则也不同（详见 docs/掌阅逆向笔记.md 十七节）。
+    """
+    try:
+        out = c.upgrade_tasks_flow()
+    except Exception as e:
+        if verbose:
+            print(f"\n等级任务: 调用失败（{e}）")
+        return False
+
+    if not out["tasks"]:
+        if verbose:
+            print("\n等级任务: 今日经验任务已全部完成（服务端不再下发）")
+        return False
+
+    reported_ok = [r for r in out["reported"] if r["ok"]]
+    failed = [r for r in out["reported"] if not r["ok"]] + \
+             [r for r in out["claimed"] if not r["ok"]]
+    # 上报名义上成功、但服务端迟迟不翻「待领取」，经验其实还没到账。
+    # 这类必须显式喊出来，否则会像 2026-11-16 那样静默漏掉一整天的经验。
+    pending = out.get("pending") or []
+
+    if verbose:
+        print("\n等级任务:")
+        for r in out["reported"]:
+            flag = "上报成功" if r["ok"] else "上报失败"
+            print(f"  {flag} {r['name']}" + ("" if r["ok"] else f": {r['msg']}"))
+        for r in out["claimed"]:
+            if r["ok"]:
+                print(f"  领取成功 {r['name']}  +{r['gained']} 经验")
+            else:
+                print(f"  领取失败 {r['name']}: {r['msg']}")
+        for r in pending:
+            print(f"  待领取 {r['name']}（服务端未翻状态，稍后跑 `level` 可补领）")
+        for t in out["tasks"]:
+            if t["status"] == 0 and "浏览书城" not in (t["name"] or ""):
+                print(f"  未自动化 {t['name']}（{t['status']}）")
+        return bool(out["claimed"])
+
+    if out["claimed"] or reported_ok:
+        bits = []
+        if reported_ok:
+            bits.append("、".join(r["name"] for r in reported_ok))
+        if out["claimed"]:
+            bits.append(f"领 {out['gained']} 经验")
+        line = "等级任务: " + "；".join(bits)
+        if failed:
+            line += f"（{len(failed)} 项失败）"
+        print("\n" + line)
+        if pending:
+            print("  [!] 已上报但未领到：" +
+                  "、".join(r["name"] for r in pending) +
+                  "，稍后跑 `level` 补领")
+    elif failed:
+        # 上报全失败时也要出声，否则精简模式看不出今天经验没拿到
+        print("\n等级任务: " + "；".join(
+            f"{r['name']} 失败({r.get('msg')})" for r in out["reported"] if not r["ok"]))
+    return bool(out["claimed"])
+
+
+VIDEO_REWARD_IDS = ["100063", "100065", "100078", "100079", "100064", "100099"]
+VIDEO_CD_SECONDS = 20   # 实测同 id 冷却约 20s（不同 id 互不影响）
+
+
+def do_video_reward(c: WelfareClient, verbose: bool = False,
+                    max_seconds: int = 0) -> float:
+    """领取「看视频送代金券」奖励（纯 HTTP，不需要真的看广告）。
+
+    2026-11-16 打通，详见 docs/掌阅逆向笔记.md 16.12：
+      端点  GET {saad}/rewarded-video/report?app_id=10000
+      签名  usr + timestamp + position（position 必须进签名）
+      id    决定发什么奖：10006x-10008x 段是代金券，1015xx 段是免广告时长
+      限制  每个 id 各有独立次数池 + 各自 20 秒冷却（不是全局冷却）
+
+    策略：**每个 id 各自领到 33709 为止**，不是固定轮数。
+    实测 38 笔 / 356 券 / 26 分钟，相邻间隔最小 2 秒（轮换 id 实现的）。
+    """
+    from .reward import claim_vouchers
+
+    def balance():
+        vs = c.vouchers()
+        return round(sum(v["amount"] for v in vs if not v.get("used")), 1)
+
+    t0 = balance()
+    if verbose:
+        print(f"\n看视频领代金券（纯 HTTP，每个 id 领到耗尽为止）")
+        print(f"  起始未用代金券: {t0}")
+
+    # 精简模式只打汇总（一行），详细模式打逐笔
+    gained, ok, log = claim_vouchers(
+        c.cred, VIDEO_REWARD_IDS,
+        delay=VIDEO_CD_SECONDS, verbose=verbose,
+        max_seconds=max_seconds)
+
+    time.sleep(3)
+    t1 = balance()
+    delta = round(t1 - t0, 1)
+    if verbose:
+        print(f"  余额: {t0} → {t1}（实测入账 {delta} 券）")
+    else:
+        # 一行说清：领了几个 id、共多少券
+        if delta > 0:
+            print(f"看视频: {ok} 次入账 {delta} 代金券（余额 {t0} → {t1}）")
+        elif ok:
+            print(f"看视频: {ok} 次成功但未增券（余额 {t0}）")
+        else:
+            print(f"看视频: 暂无可领（额度已用完，明天再来）")
+    return delta
+
+
+def do_taoshushi(c: WelfareClient, verbose: bool = False) -> bool:
+    """领淘书市活动的满减券（纯 HTTP，不需要打开 App）。
+
+    活动入口是书城「出版」频道顶部的滚动 banner（约一月换一次期），
+    里面挂的运营活动页（h5.zhangyue.com/opr/...）每期发 3~4 张满减券。
+    2026-11-17 打通，详见 docs/掌阅逆向笔记.md 二十一节。
+
+    没换期时滚动栏里没有活动页链接，此时安静跳过，不算失败。
+    """
+    from .taoshushi import claim_all
+
+    try:
+        out = claim_all(c.cred, verbose=verbose)
+    except Exception as e:
+        if verbose:
+            print(f"\n淘书市: 调用失败（{e}）")
+        return False
+
+    if not out["found"]:
+        return False
+
+    # 精简模式一行汇总（verbose 已逐张打印过）
+    if not verbose and out["items"]:
+        n = out["claimed"]
+        amt = out["total_amount"]
+        if n and amt:
+            print(f"淘书市: 领 {n} 张满减券，共 {amt:g}（{out['already']} 张已领过）")
+        elif n:
+            print(f"淘书市: 领 {n} 张满减券（{out['already']} 张已领过）")
+        elif out["already"]:
+            print(f"淘书市: {out['already']} 张均已领过")
+        elif out["failed"]:
+            print(f"淘书市: {out['failed']} 张领取失败")
+    elif not verbose:
+        print("淘书市: 本期无券可领")
+    return bool(out["claimed"] or out["already"])
+
+
 def do_box(c: WelfareClient, verbose: bool = False) -> bool:
     st = c.box_state()
     ready = [ch for ch in st["chests"] if ch["able"] and not ch["got"]]
@@ -446,8 +672,12 @@ def do_report_read_time(c: WelfareClient, minutes: int = 180,
         # 没有可铺的新时段：要么今天已铺满，要么当前时刻距零点不足。
         # 后者是常见的「没铺满」原因（例如把任务排在每天 00:30，全天只过了 30 分钟），
         # 静默会让人误以为上报出了问题，所以这里明确提示。
-        print(f"\n阅读时长: 本次无可铺时段（目标 {minutes} 分钟）"
-              f"—— 今天已铺满，或当前时刻距零点不足 {minutes} 分钟")
+        elapsed = time.localtime().tm_hour * 60 + time.localtime().tm_min
+        if elapsed < minutes:
+            print(f"\n阅读时长: 今天只过了 {elapsed} 分钟，"
+                  f"距目标 {minutes} 分钟还差 {minutes - elapsed} 分钟——稍晚再跑")
+        else:
+            print(f"\n阅读时长: 今天可铺时段已全部上报过（目标 {minutes} 分钟），无需再铺")
         return False
     ok = sum(1 for x in out if x["ok"])
     if verbose:
@@ -457,29 +687,71 @@ def do_report_read_time(c: WelfareClient, minutes: int = 180,
     tail = "" if ok == len(out) else f"（{len(out) - ok} 段失败）"
     print(f"\n阅读时长: 上报 {mins} 分钟，{ok}/{len(out)} 段成功{tail}")
     if mins < minutes:
-        # 窗口只能铺在「今天零点~此刻」之间，报不满时最可能的原因就是跑得太早。
-        print(f"  [!] 未达目标 {minutes} 分钟：窗口只铺到今天此刻，"
-              f"稍晚再跑一次可补齐剩余 {minutes - mins} 分钟（工具会自动跳过已报时段）")
+        # 报不满有两个原因，必须区分开，否则用户会以为「等一会儿还能补」：
+        #   ① 跑得太早：今天从零点到现在不足目标分钟数
+        #   ② 额度已用尽：白天反复跑，可铺的空闲时段被用光了
+        elapsed = time.localtime().tm_hour * 60 + time.localtime().tm_min
+        if elapsed < minutes:
+            print(f"  [!] 未达目标：今天只过了 {elapsed} 分钟，"
+                  f"稍晚再跑可补齐剩余 {minutes - mins} 分钟")
+        else:
+            print(f"  [!] 未达目标：今天可铺的空闲时段已用尽"
+                  f"（零点至今 {elapsed} 分钟，已报时段占了大部分）。"
+                  f"这是反复执行导致的，明天重置后可正常铺满")
     return ok > 0
 
 
 def do_tasks(c: WelfareClient, verbose: bool = False) -> bool:
-    """领取已完成的日常任务奖励（如分享日签）。
+    """领取日常任务奖励；分享日签与品质好书任务未完成时自动补上报。
 
-    任务是否完成由服务端判定，客户端只能做「已完成 → 领奖」。
-    若全部未完成，会说明每项需要什么 App 行为。
+    分享日签：调 share_daily_flow() 纯 HTTP 上报，服务端即标记完成
+    （2026-11-14 实测，status 0 → 2 且奖励直接入账），全程不需要打开 App。
+    品质好书（阅读满5分钟 / 收听满10分钟）：调 quality_task_flow()，
+    曝光书单页入口 + read/time 铺时长（2026-11-16 实测可翻转）。
+    「打开掌阅APP」的完成信号在 App 本地，不自动化。
+    领奖统一走 claim_daily_tasks。
     """
-    # 「打开掌阅APP」的真实判定是客户端冷启动上报，HTTP 敲网关只是碰运气，
-    # 失败也不影响其它任务；保留它以争取偶尔命中。
-    c.mark_app_open()
+    # 分享日签：未完成就补一次真实上报
+    share = c.share_daily_flow()
+    if share["reported"] and verbose:
+        print(f"\n分享日签: 已上报分享，状态 {share['status_before']} → {share['status_after']}")
+    elif share["msg"] and verbose:
+        print(f"\n分享日签: {share['msg']}")
+
+    # 品质好书：阅读满5分钟（res=R）+ 收听满10分钟（res=L）
+    for kw, mins, res in (("阅读品质好书", 5, "R"), ("收听品质好书", 10, "L")):
+        try:
+            q = c.quality_task_flow(kw, minutes=mins, res=res)
+        except Exception as e:
+            if verbose:
+                print(f"\n品质好书({kw}): 调用失败（{e}）")
+            continue
+        if not verbose:
+            continue
+        t = q.get("task")
+        if not t:
+            continue
+        if q.get("ok"):
+            print(f"\n品质好书: {t.get('name')} → 已达标"
+                  f"（{t.get('current')}/{t.get('quota')}），可领奖")
+        else:
+            print(f"\n品质好书: {t.get('name')} → {q.get('msg')}")
 
     tasks = c.tasks().get("body") or []
     claimable = [t for t in tasks if t.get("status") == 1]
     pending = [t for t in tasks if t.get("status") == 0]
 
+    # 换量任务不在默认渠道列表里，单独查一次：看得见才谈得上领奖
+    try:
+        cross = c.cross_app_tasks()
+    except Exception:
+        cross = []
+    cross_claimable = [t for t in cross if t.get("status") == 1]
+    cross_pending = [t for t in cross if t.get("status") == 0]
+
     if verbose:
         print("\n日常任务:")
-        if claimable:
+        if claimable or cross_claimable:
             for r in c.claim_daily_tasks():
                 if r["ok"]:
                     print(f"  领取成功 {r['name']}  {r['award']}")
@@ -492,28 +764,33 @@ def do_tasks(c: WelfareClient, verbose: bool = False) -> bool:
             print(f"  未完成 {t['name']}  {t.get('award')}")
             if target.get("description"):
                 print(f"         → {target['description']}")
-        return bool(claimable)
+        for t in cross_claimable:
+            print(f"  换量任务待领 {t['name']}  {t.get('award')}（已补入上方领奖）")
+        for t in cross_pending:
+            print(f"  换量任务未完成 {t['name']}  {t.get('award')}"
+                  f"（需手动去对方 App 完成）")
+        return bool(claimable or cross_claimable)
 
-    # 紧凑模式：领奖合并一行；未完成项按「能否纯 HTTP 完成」分开措辞。
-    # 「打开掌阅APP」理论上可纯 HTTP 尝试（mark_app_open 已敲网关），
-    # 其余三项（阅读/收听/分享日签）的完成信号在原生层，只能真机补。
-    results = c.claim_daily_tasks() if claimable else []
+    # 紧凑模式：领奖合并一行；未完成项里只标注真正需要 App 行为的那些。
+    results = c.claim_daily_tasks() if (claimable or cross_claimable) else []
     ok_names = [f"{r['name']} {r['award']}".strip() for r in results if r["ok"]]
     fail_names = [f"{r['name']}: {r['msg']}" for r in results if not r["ok"]]
 
-    HTTP_ONLY = "打开掌阅APP"
-    http_pending = [t for t in pending if t["name"] == HTTP_ONLY]
-    dev_pending = [t for t in pending if t["name"] != HTTP_ONLY]
+    dev_pending = [t for t in pending if t["name"] != "分享今日日签"]
+    share_pending = [t for t in pending if t["name"] == "分享今日日签"]
 
     parts = []
     if ok_names:
         parts.append("领取 " + "；".join(ok_names))
-    if http_pending:
-        parts.append(f"{len(http_pending)} 项待触发（{HTTP_ONLY}）")
+    if share_pending:
+        parts.append("分享日签仍未翻转（可能服务端延迟，稍后再跑一次 tasks）")
     if dev_pending:
         names = "、".join(t["name"].replace("品质好书 ", "").replace("今日", "")
                          for t in dev_pending)
         parts.append(f"{len(dev_pending)} 项待真机（{names}）")
+    if cross_pending:
+        names = "、".join(t["name"] for t in cross_pending)
+        parts.append(f"{len(cross_pending)} 项换量任务需手动做（{names}）")
     if fail_names:
         parts.append("失败 " + "；".join(fail_names))
     if parts:
@@ -528,7 +805,9 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例:\n"
-            "  ireader-welfare run                     铺阅读时长 → 签到 → 领阅读奖 → 领任务 → 转盘 → 阅读抽奖 → 开箱\n"
+            "  ireader-welfare run                     铺时长 → 签到 → 领阅读奖 → 领任务 → 等级 → 转盘 → 阅读抽奖 → 开箱 → 看视频领券\n"
+            "  ireader-welfare run --no-video          同上，但不领看视频代金券\n"
+            "  ireader-welfare video                   只领看视频代金券（逐笔日志）\n"
             "  ireader-welfare status                  查看状态\n"
             "  ireader-welfare lottery                只抽阅读时长抽奖（每天 4 次）\n"
             "  ireader-welfare sign --no-wheel         只签到，不抽奖\n"
@@ -537,7 +816,8 @@ def build_parser():
     )
     ap.add_argument("command", nargs="?", default="run",
                     choices=["status", "run", "sign", "wheel", "lottery",
-                             "read", "box", "tasks"],
+                             "read", "box", "tasks", "level", "video",
+                             "taoshushi"],
                     help="要执行的动作，默认 run")
     ap.add_argument("--phone", help="手机号（也可用环境变量 IREADER_PHONE 或配置文件）")
     ap.add_argument("--password", help="密码（也可用环境变量 IREADER_PWD 或配置文件）")
@@ -547,6 +827,14 @@ def build_parser():
     ap.add_argument("--no-read", action="store_true", help="跳过阅读任务领奖")
     ap.add_argument("--no-box", action="store_true", help="跳过宝箱开启")
     ap.add_argument("--no-tasks", action="store_true", help="跳过日常任务领奖")
+    ap.add_argument("--no-level", action="store_true",
+                    help="跳过等级成长任务（浏览书城得经验）")
+    ap.add_argument("--no-video", action="store_true",
+                    help="跳过看视频领券（默认 run 会领）")
+    ap.add_argument("--no-taoshushi", action="store_true",
+                    help="跳过淘书市满减券（默认 run 会领）")
+    ap.add_argument("--video-max-seconds", type=int, default=0,
+                    help="看视频领券的时长上限（秒），0=不限制（领到全部耗尽为止）")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出状态（便于脚本调用）")
     ap.add_argument("--verbose", action="store_true",
                     help="完整逐行输出（含操作后全量状态）；默认精简为关键行")
@@ -588,6 +876,14 @@ def main(argv=None):
         show_tasks(c)
         return 0
 
+    if args.command == "video":
+        do_video_reward(c, vb, max_seconds=args.video_max_seconds)
+        return 0
+
+    if args.command == "taoshushi":
+        do_taoshushi(c, vb)
+        return 0
+
     if args.command in ("run", "sign"):
         do_sign(c, vb)
     # 顺序有讲究：
@@ -600,6 +896,8 @@ def main(argv=None):
         do_read(c, vb)
     if args.command in ("run", "tasks") and not args.no_tasks:
         do_tasks(c, vb)
+    if args.command in ("run", "level") and not args.no_level:
+        do_level_tasks(c, vb)
     if args.command in ("run", "wheel") and not args.no_wheel:
         # 必须用关键字传参：do_wheel 的第二个形参是 max_times 而不是 verbose，
         # 按位置传 vb 会让精简模式（vb=False）变成 max_times=0，静默一次都不抽。
@@ -608,6 +906,17 @@ def main(argv=None):
         do_read_lottery(c, vb)
     if args.command in ("run", "box") and not args.no_box:
         do_box(c, vb)
+
+    # 看视频领券：纯 HTTP，不依赖前面任何步骤。
+    # 放在最后是因为它耗时最长（每 id 20s 冷却），且收益要进下面的「账面」。
+    # run 默认包含它——「run 跑全部」才符合直觉，漏掉一项就是坑。
+    if args.command == "run" and not args.no_video:
+        do_video_reward(c, vb, max_seconds=args.video_max_seconds)
+
+    # 淘书市满减券：活动一月约换两次，滚动栏里挂着才能领；
+    # 没换期时自动跳过（不出声），有则逐张领。
+    if args.command == "run" and not args.no_taoshushi:
+        do_taoshushi(c, vb)
 
     if vb:
         print("\n" + "=" * 46)

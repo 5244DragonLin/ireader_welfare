@@ -1,16 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""真机 UI 自动化：在 App 内点一次真实的「分享今日日签」。
+"""真机 UI 自动化：在 App 内点一次真实的「分享今日日签」（备用手段）。
 
-为什么需要它
-------------
-「分享今日日签」（+20 代金券）的完成动作在 App 原生层：
-H5 只调一句 `downloadImage()` 让原生弹系统分享面板，
-分享成功后回调仅 `updateTaskList`（重拉列表），**全程没有 HTTP 上报**。
+2026-11-14 起有了更简单的路：分享日签可以**纯 HTTP** 完成——
+`src/main.py tasks` / `run` 会调 `WelfareClient.report_share()` 重放 App 的
+分享上报（`/user/scomm/share_report`），任务直接翻转领 20 代金券。
+协议还原见 docs/掌阅逆向笔记.md 6.3 节。
 
-我实测过所有像上报的接口（`/user/scomm/share_report`、`/welfare/operation/callback`、
-`/zycl/welfare/task/finish` …），全部是幂等空壳，任务 `status` 一律不变。
-所以纯协议层做不到，必须让 App **真的分享一次**。
+本脚本保留作备用（比如服务端收紧了上报校验、或想让 App 里留下真实分享记录时用）。
 
 本脚本用 adb 驱动真实设备完成这件事——**不 root、不 hook、不伪造**：
     ① 用 deeplink 打开福利中心

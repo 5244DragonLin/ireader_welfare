@@ -26,8 +26,10 @@
 服务端按「分钟」去重：同一时段重复上报只返回 code:0 而 current 不变。
 所以用 output/read_pc_state.json 记录当天已报时段，避免白报。
 
-注意它**不驱动**日常任务「阅读品质好书满5分钟」「收听品质好书满10分钟」，
-那两条是独立的计数器（实测阅读档位满 180 分钟时它们仍是 0）。
+注意主流程的 `report_minutes` **不驱动**日常任务「阅读品质好书满5分钟」
+「收听品质好书满10分钟」，那两条是独立的计数器（实测阅读档位满 180 分钟时
+它们仍是 0）。它们由 welfare.quality_task_flow 单独上报，但**共用本模块的
+分钟去重池**（仅 res="R"），所以那边要用 `free_windows()` 挑未报过的时段。
 
 用法
 ----
@@ -78,8 +80,12 @@ def pc_query(usr: str, zysid: str) -> str:
 
 
 def report_once(usr: str, zysid: str, book_id: str,
-                start_ms: int, end_ms: int, switch: int = SWITCH_END) -> dict:
-    """上报一段阅读区间。返回服务端 JSON。"""
+                start_ms: int, end_ms: int, switch: int = SWITCH_END,
+                res: str = "R") -> dict:
+    """上报一段阅读区间。返回服务端 JSON。
+
+    res："R" 阅读 / "L" 收听。收听任务的时长必须用 "L"，用 "R" 报多久都不计。
+    """
     now = int(time.time() * 1000)
     body = {
         "book_id": str(book_id),
@@ -87,7 +93,7 @@ def report_once(usr: str, zysid: str, book_id: str,
         "local_bid": "",
         "start_time": int(start_ms),
         "end_time": int(end_ms),
-        "res": "R",
+        "res": res,
         "time_stamp": now,
         "date": int(time.strftime("%Y%m%d")),
         "switch": int(switch),
@@ -154,6 +160,44 @@ def plan_windows(minutes: float, step: int, used: list) -> list:
             need -= cursor - start
         cursor = start
     return windows
+
+
+def mark_used(start_ms: int, end_ms: int):
+    """把一段已成功上报的区间并入今天的去重记录。
+
+    单独暴露是为了「先上报、成功后再记账」——若上报失败却提前记账，
+    这 5 分钟就白白浪费掉了（服务端没计到，本地又当它已用）。
+    """
+    state = _load_state()
+    used = _today_ranges(state)
+    used.append((int(start_ms), int(end_ms)))
+    _save_state({"date": time.strftime("%Y%m%d"),
+                 "ranges": [[s, e] for s, e in used]})
+
+
+def free_windows(minutes: float, step: int = 5) -> list:
+    """取今天还没上报过的空闲时间窗（供「品质好书」任务使用）。
+
+    为什么必须挑空闲窗
+    ------------------
+    服务端按「分钟」在 res="R" 内**跨任务**去重。`run` 的顺序是「先铺 180 分钟
+    主流程时长 → 再处理日常任务」，而主流程的窗口末尾正好压在当前时刻。
+    任务若仍用 `now-5min → now`，这 5 分钟几乎全落在主流程已报区间里被吃掉：
+
+        2026-11-17 实测：主流程 01:00:48→04:00:48，任务窗口 03:55:50→04:00:50，
+        重叠 4/5 分钟 → 服务端当前值停在 0/10，任务不翻转、奖励拿不到。
+
+    改用本函数挑一段「今天没报过」的窗口即可正常翻转（同日 10:32 复测
+    立刻 0/10 → 10/10）。
+
+    本函数只做规划、**不写状态**：调用方必须在上报成功后再调 `mark_used()`，
+    否则上报失败却提前记账，这几分钟就白丢了。
+
+    注意：只有 res="R" 才需要这套去重 —— 收听（"L"）是独立计数器，
+    不占 R 的分钟池，也不该记进 read_pc_state.json。
+    """
+    used = _today_ranges(_load_state())
+    return plan_windows(minutes, step, used)
 
 
 def report_minutes(usr: str, zysid: str, book_id: str, minutes: float,
